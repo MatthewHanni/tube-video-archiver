@@ -13,8 +13,11 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 import time
 import random
-import logging
+import string
 
+
+
+EXCEPTIONS_THRESHOLD = 3
 MAX_RESULTS = 50
 PART = "contentDetails,id,snippet,status"
 tmp_file = '/tmp/tmp.file'
@@ -23,7 +26,7 @@ tmp_video_enc_path = '/tmp/tmp.enc'
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 EXECUTION_TAG = None
 
-
+LOG_ID = f'{"".join(random.choice(string.ascii_uppercase) for i in range(3))}-{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
 
 def list_playlists(youtube_client, part, max_results):
     """
@@ -39,24 +42,32 @@ def list_playlists(youtube_client, part, max_results):
     next_page_token = None
     page = 1
     while True:
-        print(f'Querying for playlists. Page:{page}')
+        print_log(f'Querying for playlists. Page:{page}')
         request = youtube_client.playlists().list(part=part, maxResults=max_results,
                                                   mine=True) if next_page_token is None else youtube_client.playlists().list(
             part=part, maxResults=max_results, mine=True, pageToken=next_page_token)
         response = request.execute()
         if 'items' in response:
-            print(f'Found {len(response["items"])} playlists.')
+            print_log(f'Found {len(response["items"])} playlists.')
             playlists.extend(response['items'])
 
         page += 1
 
         if 'nextPageToken' in response and response['nextPageToken'] is not None:
             next_page_token = response['nextPageToken']
-            print(f'nextPageToken found.')
+            print_log(f'nextPageToken found.')
         else:
             break
         time.sleep(1)
     return playlists
+
+def print_log(message):
+    """
+    Prepends a log message with a log instance ID. AWS suggests use of the simple print statement for logging in Lambda
+            Parameters:
+                    message (str): log message
+    """
+    print(f'{LOG_ID} {message}')
 
 
 def list_playlist_videos(youtube_client, playlists, part, max_results):
@@ -75,27 +86,27 @@ def list_playlist_videos(youtube_client, playlists, part, max_results):
 
 
     playlist_count = 0
-    print(f'Finding videos in {len(playlists)} playlists.')
+    print_log(f'Finding videos in {len(playlists)} playlists.')
     for playlist in playlists:
         next_page_token = None
         page = 1
         playlist_count += 1
         playlist_id = playlist['id']
         while True:
-            print(f'Querying for videos. Playlist {playlist_id}: {playlist_count} of {len(playlists)} Page:{page}')
+            print_log(f'Querying for videos. Playlist {playlist_id}: {playlist_count} of {len(playlists)} Page:{page}')
             request = youtube_client.playlistItems().list(part=part, maxResults=max_results,
                                                           playlistId=playlist_id) if next_page_token is None \
                 else youtube_client.playlistItems().list(part=part, maxResults=max_results, playlistId=playlist_id,
                                                          pageToken=next_page_token)
             response = request.execute()
             if 'items' in response:
-                print(f'Found {len(response["items"])} videos.')
+                print_log(f'Found {len(response["items"])} videos.')
                 videos.extend(response['items'])
 
             page += 1
 
             if 'nextPageToken' in response:
-                print(f'nextPageToken found.')
+                print_log(f'nextPageToken found.')
                 next_page_token = response['nextPageToken']
             else:
                 break
@@ -116,20 +127,20 @@ def refresh_credentials(s3_client, bucket, creds_key, creds):
                     creds (object): Google API credentials object, updated with refreshed credentials
     """
     if creds and creds.expired and creds.refresh_token:
-        print('Creds are expired. Refreshing...')
+        print_log('Creds are expired. Refreshing...')
         creds.refresh(Request())
     else:
-        print('Entering flow...')
+        print_log('Entering flow...')
         flow = InstalledAppFlow.from_client_secrets_file(
             tmp_file, SCOPES)
-        print('Authenticating...')
+        print_log('Authenticating...')
         creds = flow.run_local_server(port=0)
-    print(f'Dumping creds to {tmp_file}')
+    print_log(f'Dumping creds to {tmp_file}')
     with open(tmp_file, 'wb') as token:
         pickle.dump(creds, token)
-    print(f'Re-uploading creds {tmp_file} to s3://{bucket}/{creds_key}')
+    print_log(f'Re-uploading creds {tmp_file} to s3://{bucket}/{creds_key}')
     s3_client.upload_file(bucket=bucket, key=creds_key, local_path=tmp_file)
-    print('Returning refreshed credentials.')
+    print_log('Returning refreshed credentials.')
     return creds
 
 
@@ -149,21 +160,21 @@ def authenticate(s3_client, bucket, creds_key):
     api_version = "v3"
     creds = None
 
-    print(f'Downloading creds file s3://{bucket}/{creds_key} to {tmp_file}')
+    print_log(f'Downloading creds file s3://{bucket}/{creds_key} to {tmp_file}')
     s3_client.download_file(bucket=bucket, key=creds_key, local_path=tmp_file)
 
-    print(f'Loading creds pickle file at {tmp_file}')
+    print_log(f'Loading creds pickle file at {tmp_file}')
     with open(tmp_file, 'rb') as token:
         creds = pickle.load(token)
     # If there are no (valid) credentials available, let the user log in.
 
     if not creds.valid:
-        print('Refreshing credentials')
+        print_log('Refreshing credentials')
         creds = refresh_credentials(s3_client=s3_client, bucket=bucket, creds_key=creds_key, creds=creds)
 
-    print('Building service')
+    print_log('Building service')
     youtube_client = build(api_service_name, api_version, credentials=creds)
-    print('Authenticated')
+    print_log('Authenticated')
     return youtube_client
 
 
@@ -183,38 +194,59 @@ def encrypt_video(fernet_str):
         encrypted_file.write(encrypted)
 
 
-def process_video(s3_client, bucket_name, folder_name,video, video_id, video_json_key, fernet_str):
+def process_video(s3_client, bucket, folder_name, video, video_id, video_json_key, fernet_str):
+    """
+    Downloads a video, encrypts it, and uploads it to S3
+            Parameters:
+                    s3_client (object): Helper resource for interacting with AWS S3
+                    bucket (str): Name of the project bucket
+                    folder_name(str): Project folder
+                    video(dict): dict representation of JSON record from YouTube for the given video
+                    video_id(str): Unique identifier for the video on YouTube
+                    video_json_key(str): The location where we will upload the video.
+                    fernet_str(str): Encryption key used to encrypt the video
 
+    """
     link = f'https://www.youtube.com/watch?v={video_id}'
-    print(f'processing {link}')
+    print_log(f'Processing {link}')
     try:
         yt = YouTube(link)
         ys = yt.streams.get_highest_resolution()
 
-        print(f'downloading\t{link}\t{ys.default_filename}')
+        print_log(f'Downloading\t{link}\t{ys.default_filename}')
         ys.download(output_path='/tmp', filename='tmp.mp4')
 
         encrypt_video(fernet_str=fernet_str)
 
         out_key = f'{folder_name}/videos/{video_id}.enc'
-        print(f'Uploading to {out_key}')
-        s3_client.upload_file(bucket=bucket_name, key=out_key, local_path=tmp_video_enc_path)
-        print('Writing json')
+        print_log(f'Uploading to {out_key}')
+        s3_client.upload_file(bucket=bucket, key=out_key, local_path=tmp_video_enc_path)
+        print_log('Writing json')
         with open(tmp_file, 'w') as outfile:
             json.dump(video, outfile)
-        print('Uploading json')
-        s3_client.upload_file(bucket=bucket_name, key=video_json_key, local_path=tmp_file)
+        print_log('Uploading json')
+        s3_client.upload_file(bucket=bucket, key=video_json_key, local_path=tmp_file)
 
     except Exception as e:
-        print(f'Uploading exception {e}')
+        print_log(f'Uploading exception {e}')
         video['yta-exception'] = str(e)
         exceptions_json_key = f'{folder_name}/exceptions/{video_id}/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.json'
         with open(tmp_file, 'w') as outfile:
             json.dump(video, outfile)
-        s3_client.upload_file(bucket=bucket_name, key=exceptions_json_key, local_path=tmp_file)
+        s3_client.upload_file(bucket=bucket, key=exceptions_json_key, local_path=tmp_file)
 
-def create_captured_video_digest(videos,folder_name,completed_yt_uploads_s3_keys):
-    counter = Counter(exception_instances)
+def create_captured_video_digest(s3_client,bucket,videos,folder_name,completed_yt_uploads_s3_keys,exceptions_counter):
+    """
+    Downloads a video, encrypts it, and uploads it to S3
+            Parameters:
+                    s3_client (object): Helper resource for interacting with AWS S3
+                    bucket (str): Name of the project bucket
+                    videos(list): List of dict representation of JSON records for YouTube videos in playlists
+                    folder_name(str): Project folder
+                    completed_yt_uploads_s3_keys(list): List of .json file keys associated with completed uploads
+                    exceptions_counter(counter): Counter for video IDs which failed processing
+
+    """
     digest = []
     for video in videos:
         video_id = video['snippet']['resourceId']['videoId']
@@ -223,7 +255,7 @@ def create_captured_video_digest(videos,folder_name,completed_yt_uploads_s3_keys
 
         digest_record = {'video_id':video['snippet']['resourceId']['videoId'],
                          'Captured': _json_key in completed_yt_uploads_s3_keys,
-                         'Exceptions':counter[video_id],
+                         'Exceptions':exceptions_counter[video_id],
                          'Link':_link}
         digest.append(digest_record)
 
@@ -233,57 +265,65 @@ def create_captured_video_digest(videos,folder_name,completed_yt_uploads_s3_keys
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(digest)
-    s3_client.upload_file(bucket=bucket_name,key=f'{folder_name}/digest.csv',local_path=tmp_file)
+    s3_client.upload_file(bucket=bucket,key=f'{folder_name}/digest.csv',local_path=tmp_file)
 
 
 def main():
-    print('Starting...')
+    print_log('Starting...')
     s3_client = aws.S3Helper()
     secrets = aws.get_secrets()
 
-    bucket_name = secrets[os.getenv('KEY_BUCKET_NAME')]
+    bucket = secrets[os.getenv('KEY_BUCKET_NAME')]
     folder_name = secrets[os.getenv('KEY_PROJECT_FOLDER_NAME')]
     creds_key = secrets[os.getenv('KEY_YTA_CREDS_PATH')]
     fernet_str = secrets[os.getenv('KEY_FERNET')]
-    print(
-        f'Retrieved secrets parameters: bucket:{bucket_name} folder:{folder_name} creds(len):{len(creds_key)} fernet(len):{len(fernet_str)}')
+    print_log(
+        f'Retrieved secrets parameters: bucket:{bucket} folder:{folder_name} creds(len):{len(creds_key)} fernet(len):{len(fernet_str)}')
 
 
-    youtube_client = authenticate(creds_key=creds_key, bucket=bucket_name, s3_client=s3_client)
+    youtube_client = authenticate(creds_key=creds_key, bucket=bucket, s3_client=s3_client)
     playlists = list_playlists(youtube_client=youtube_client, part=PART, max_results=MAX_RESULTS)
-    print(f'Retrieved playlist count: {len(playlists)}')
+    print_log(f'Retrieved playlist count: {len(playlists)}')
 
     videos = list_playlist_videos(youtube_client=youtube_client, part=PART, max_results=MAX_RESULTS,
                                   playlists=playlists)
-    print(f'Retrieved playlist video count:{len(videos)}')
+    print_log(f'Retrieved playlist video count:{len(videos)}')
     random.shuffle(videos)
 
     # We use this list to check videos which have already been captured.
     # Even if the video file is moved off of S3, we should maintain the JSON for the video as a record
     # that it has been captured already.
     completed_yt_uploads_s3_keys = [x['Key'] for x in
-                                    s3_client.list_objects(bucket=bucket_name, prefix=f'{folder_name}/json/')]
-    print(f'Found {len(completed_yt_uploads_s3_keys)} jsons')
+                                    s3_client.list_objects(bucket=bucket, prefix=f'{folder_name}/json/')]
+    print_log(f'Found {len(completed_yt_uploads_s3_keys)} completed video JSON records')
 
     # Some videos will fail occasionally. Others will fail systemically.
     # The exceptions list can be used to tally the number of fails that occurred for a given video.
     # If an attempt threshold has been exceeded, we will no longer continue to try to capture this video.
     exceptions_s3_keys = [x['Key'] for x in
-                                    s3_client.list_objects(bucket=bucket_name, prefix=f'{folder_name}/exceptions/')]
-    print('Creating exceptions counter...')
-    exception_instances = [exception_key.split('/')[2] for exception_key in exceptions_s3_keys]
+                                    s3_client.list_objects(bucket=bucket, prefix=f'{folder_name}/exceptions/')]
+    print_log('Creating exceptions counter...')
 
-    print('Creating Digest...')
-    create_captured_video_digest()
+    # Exceptions are recorded in S3 at project-folder/exceptions/{video_id}/{timestamp}.json
+    # The [2] index represents the video ID. This comprehension returns the video ID associated with each individual exception
+    exception_instances = [exception_key.split('/')[2] for exception_key in exceptions_s3_keys]
+    exceptions_counter = Counter(exception_instances)
+
+    print_log('Creating Digest...')
+    create_captured_video_digest(s3_client=s3_client,bucket=bucket,videos=videos,folder_name=folder_name,completed_yt_uploads_s3_keys=completed_yt_uploads_s3_keys,exceptions_counter=exceptions_counter)
 
     for video in videos:
         video_id = video['snippet']['resourceId']['videoId']
         video_json_key = f'{folder_name}/json/{video_id}.json'
-        if video_json_key not in completed_yt_uploads_s3_keys and counter[video_id] < 3:
+        if video_json_key not in completed_yt_uploads_s3_keys and exceptions_counter[video_id] < EXCEPTIONS_THRESHOLD:
 
-            print('Fernet encrypted key encoded.')
-            process_video(s3_client=s3_client, bucket_name=bucket_name, folder_name=folder_name,video=video, video_id=video_id,
+            process_video(s3_client=s3_client, bucket=bucket, folder_name=folder_name,video=video, video_id=video_id,
                           video_json_key=video_json_key, fernet_str=fernet_str)
+
+            # Because this operates from a lambda, we are limited to a 15-minute run-time.
+            # For the vast majority of videos, this is sufficient.
+            # To save on compute times, we should end after one try instead of making attempts to
+            # download more videos and be prematurely cut when the instance ends.
             break
 
     return None
