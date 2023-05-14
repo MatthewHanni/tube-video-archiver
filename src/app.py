@@ -14,6 +14,7 @@ from google.auth.transport.requests import Request
 import time
 import random
 import string
+import pandas as pd
 
 
 
@@ -235,36 +236,77 @@ def process_video(s3_client, bucket, folder_name, video, video_id, video_json_ke
             json.dump(video, outfile)
         s3_client.upload_file(bucket=bucket, key=exceptions_json_key, local_path=tmp_file)
 
-def create_captured_video_digest(s3_client,bucket,videos,folder_name,completed_yt_uploads_s3_keys,exceptions_counter):
+def create_video_digest(s3_client,bucket,videos,folder_name):
     """
-    Downloads a video, encrypts it, and uploads it to S3
+    Creates a digest table so that the latest status of videos
             Parameters:
                     s3_client (object): Helper resource for interacting with AWS S3
                     bucket (str): Name of the project bucket
                     videos(list): List of dict representation of JSON records for YouTube videos in playlists
                     folder_name(str): Project folder
-                    completed_yt_uploads_s3_keys(list): List of .json file keys associated with completed uploads
                     exceptions_counter(counter): Counter for video IDs which failed processing
 
     """
+
+
+    completed_video_object_list = s3_client.list_objects(bucket=bucket, prefix=f'{folder_name}/json/')
+    exceptions_object_list = s3_client.list_objects(bucket=bucket, prefix=f'{folder_name}/exceptions/')
+
+
     digest = []
     for video in videos:
         video_id = video['snippet']['resourceId']['videoId']
         _json_key = f'{folder_name}/json/{video_id}.json'
+        _exception_key_prefix = f'{folder_name}/exceptions/{video_id}/'
         _link = f'https://www.youtube.com/watch?v={video_id}'
 
+        video_title = None
+        is_captured = False
+        size = None
+        last_modified = None
+        for obj in completed_video_object_list:
+            key = obj['Key']
+            if key == _json_key:
+                is_captured = True
+                size = obj['Size']
+                last_modified = obj['LastModified']
+
+                s3_client.download_file(bucket=bucket, key=key, local_path=tmp_file)
+                with open(tmp_file) as json_file:
+                    data = json.load(json_file)
+                    video_title = data['snippet']['title']
+                break
+
+        exception_list = []
+        for obj in exceptions_object_list:
+            key = obj['Key']
+            if _exception_key_prefix in key  and key.endswith('.json'):
+                exception_date = obj['LastModified']
+                s3_client.download_file(bucket=bucket, key=key, local_path=tmp_file)
+                with open(tmp_file) as json_file:
+                    data = json.load(json_file)
+                    video_title = video_title if video_title is not None else data['snippet']['title']
+                    exception_msg = data['yta-exception']
+                exception_list.append(f'{exception_date}--{exception_msg}')
+
+
+        exceptions = ':::'.join(exception_list)
+
+
+
         digest_record = {'video_id':video['snippet']['resourceId']['videoId'],
-                         'Captured': _json_key in completed_yt_uploads_s3_keys,
-                         'Exceptions':exceptions_counter[video_id],
+                         'Title':video_title,
+                         'Captured': is_captured,
+                         'Size':size,
+                         'LastModified':last_modified,
+                         'Exceptions Count':len(exception_list),
+                         'Exceptions':exceptions,
                          'Link':_link}
         digest.append(digest_record)
 
 
-    fieldnames = ["video_id","Captured", "Exceptions","Link"]
-    with open(tmp_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(digest)
+    df = pd.DataFrame(digest)
+    df.to_csv(tmp_file,encoding='utf-8')
     s3_client.upload_file(bucket=bucket,key=f'{folder_name}/digest.csv',local_path=tmp_file)
 
 
@@ -279,7 +321,6 @@ def main():
     fernet_str = secrets[os.getenv('KEY_FERNET')]
     print_log(
         f'Retrieved secrets parameters: bucket:{bucket} folder:{folder_name} creds(len):{len(creds_key)} fernet(len):{len(fernet_str)}')
-
 
     youtube_client = authenticate(creds_key=creds_key, bucket=bucket, s3_client=s3_client)
     playlists = list_playlists(youtube_client=youtube_client, part=PART, max_results=MAX_RESULTS)
@@ -310,7 +351,7 @@ def main():
     exceptions_counter = Counter(exception_instances)
 
     print_log('Creating Digest...')
-    create_captured_video_digest(s3_client=s3_client,bucket=bucket,videos=videos,folder_name=folder_name,completed_yt_uploads_s3_keys=completed_yt_uploads_s3_keys,exceptions_counter=exceptions_counter)
+    create_video_digest(s3_client=s3_client,bucket=bucket,videos=videos,folder_name=folder_name)
 
     for video in videos:
         video_id = video['snippet']['resourceId']['videoId']
@@ -330,7 +371,6 @@ def main():
 
 
 def handler(event, context):
-    EXECUTION_TAG
     result = main()
 
     return {
