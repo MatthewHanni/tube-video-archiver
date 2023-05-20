@@ -1,6 +1,6 @@
 FROM public.ecr.aws/lambda/python:3.8
 
-COPY /src .
+COPY /tubevault/src .
 
 ENV SECRET_NAME prod/hanni
 ENV REGION_NAME us-east-1
